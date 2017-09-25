@@ -6,7 +6,7 @@ describe table claims_submits_provider;
 select * from claims_submits_provider limit 100;
 
 ---------------------------------------------------------------------------------------------
-
+--this section is for facility to health system mastering
 --creating columnns for different NPI's associated with each claim number
 CREATE OR REPLACE TABLE claims_submits_provider_NPI_type as
 select distinct(claim_number) as claim_number, 
@@ -458,3 +458,576 @@ select distinct organization_type from claims_submits_provider_npi_type_facility
 --grant the table to maddy
 grant all on claims_submits_provider_npi_type_facility_mapping_final to rwd_sandbox;
 
+
+--------------------------------------------------------------------------------------------------------------
+--Section below is for physician to facility to health system mastering
+							
+--make a rendering_npi, facility_npi, count_claims reference table
+create or replace table sandbox.ml_claims_submits_rendering as
+select *
+from sandbox.claims_submits_provider
+where provider_type in ('Attending', 'Rendering')
+	and provider_npi is not null and provider_npi <> 'NULL';
+	
+
+	
+create or replace table sandbox.ml_claims_submits_facility_rendering as
+select A.claim_number
+		, A.provider_npi as facility_npi
+		, B.provider_npi as rendering_npi
+from sandbox.ml_claims_submits_facility A
+		inner join sandbox.ml_claims_submits_rendering B
+				on A.claim_number = B.claim_number; --2.6G		
+
+create or replace table sandbox.ml_claims_submits_rendering_facility_claim_count as
+select rendering_npi, facility_npi, count(distinct claim_number) as count_claim
+from sandbox.ml_claims_submits_facility_rendering
+group by rendering_npi, facility_npi;		
+
+--cleansing the rendering NPI's
+delete from sandbox.ml_claims_submits_rendering_facility_claim_count
+where length(trim(rendering_npi)) <> 10
+		or rendering_npi = '0000000000'
+		or contains(rendering_npi, '+')
+		or contains(rendering_npi, '.')
+		or try_to_number(rendering_npi) is null
+		or try_to_number(facility_npi) is null;
+
+		
+select *
+from sandbox.ml_claims_submits_rendering_facility_claim_count
+order by rendering_npi, count_claim desc;
+
+--adding in row number, because later we want to limit to only instances where the rendering was associated with a facility > 10 times
+create or replace table sandbox.ml_claims_submits_rendering_facility_claim_count_row_number as
+select rendering_npi, facility_npi, count_claim
+		, row_number () over(partition by rendering_npi order by count_claim desc) as rnk
+from sandbox.ml_claims_submits_rendering_facility_claim_count;	
+
+
+--filter 1 by all time claim > 10 and find the most common facility associated with this rendering npi
+create or replace table sandbox.ml_claims_submits_rendering_facility_claim_count_row_number_filtered_1 as
+select rendering_npi, facility_npi, count_claim
+from sandbox.ml_claims_submits_rendering_facility_claim_count_row_number
+where rnk = 1
+		and count_claim > 10; --1077261
+
+select *
+from ml_claims_submits_rendering_facility_claim_count_row_number_filtered
+order by rendering_npi;
+
+
+--filter 2 by making sure that all faclity_npi is a real organization by cmsnpi standard
+create or replace table sandbox.ml_claims_submits_rendering_facility_claim_count_row_number_filtered_2 as
+select distinct A.*
+from sandbox.ml_claims_submits_rendering_facility_claim_count_row_number_filtered_1 A
+		left join sandbox.srn_cmsnpi_latest B
+			   on A.facility_npi = B.npi
+where entity_type_code <> '1' or entity_type_code is null; --1031815
+
+
+--filter 3 by making sure that all faclity_npi is a real organization by healthbase standard
+create or replace table sandbox.ml_claims_submits_rendering_facility_claim_count_row_number_filtered_3 as
+select distinct A.*, B.node_1_label as organization_label
+from sandbox.ml_claims_submits_rendering_facility_claim_count_row_number_filtered_2 A
+		left join sandbox.entities_for_hs6 B
+			   on A.facility_npi = B.service_npi
+where B.Node_1_label <> 'physician'
+		or B.Node_1_label is null; --1031813
+		
+
+/*coalescing labels here because there is not a perfect fill rate between health base tables which have label and we want to know
+what type of facility something is*/
+/*entities_for_hs_6 is an internal table we made*/
+create or replace table sandbox.ml_claims_submits_rendering_facility_claim_count_row_number_filtered_4 as
+select distinct A.rendering_npi
+				, A.facility_npi
+				, A.count_claim
+				, coalesce(A.organization_label, C.node_2_label) as organization_label
+from sandbox.ml_claims_submits_rendering_facility_claim_count_row_number_filtered_3 A
+		left join sandbox.entities_for_hs6 C
+				on A.facility_npi = C.organization_npi
+where coalesce(A.organization_label, C.node_2_label) <> 'physician'
+        or coalesce(A.organization_label, C.node_2_label) is null; --1031813
+		
+		
+/*here we are also looking for a label name that is valid for a facility, since entities_for_hs_6 won't capture all cases*/
+create or replace table sandbox.ml_claims_submits_rendering_facility_claim_count_row_number_filtered_5 as
+select distinct A.rendering_npi
+				, A.facility_npi
+				, A.count_claim
+				, coalesce(A.organization_label, C.label) as organization_label
+from sandbox.ml_claims_submits_rendering_facility_claim_count_row_number_filtered_4 A
+		left join rwd.healthbase_entitylookup C
+				on A.facility_npi = C.identifier
+where coalesce(A.organization_label, C.label)  <> 'physician'
+        or coalesce(A.organization_label, C.label) is null;		
+		
+
+		
+select count(*)
+from ml_claims_submits_rendering_facility_claim_count_row_number_filtered_5 --1029146
+where organization_label is null; --27267
+
+--only keep those with an organization label
+create or replace table sandbox.ml_claims_submits_rendering_facility_claim_count_row_number_filtered_6 as
+select distinct A.rendering_npi
+				, A.facility_npi
+				, A.count_claim
+				, organization_label
+from sandbox.ml_claims_submits_rendering_facility_claim_count_row_number_filtered_5 A
+where organization_label is not null;	--1001879
+
+-------------------
+
+--make an OCGN reference table
+create or replace table sandbox.ml_ocgn_physicin_facility_mapping_1 as
+select distinct npi_num, practice_npi_1
+from SANDBOX.STAGING_HDS2 A
+		inner join sandbox.SV_OCGN_ALL_NPI_COMPANY_ID_XWALK B
+				on A.npi_num = B.npi
+		inner join sandbox.STAGING_HDS1 C
+				on B.company_id = C.companyid
+where practice_npi_1 <> '' and practice_npi_1 is not null; --1324
+
+
+--grab label from entity lookup table
+create or replace table sandbox.ml_ocgn_physicin_facility_mapping_2 as
+select distinct npi_num as rendering_npi
+				, practice_npi_1 as facility_npi
+				, C.label as organization_label
+from SANDBOX.ml_ocgn_physicin_facility_mapping_1 A
+		left join rwd.healthbase_entitylookup C
+				on A.practice_npi_1 = C.identifier
+where organization_label <> 'physician'; --remove those without a label as well as physicians
+				--1322
+
+	
+				
+	
+				
+--------------------------------------------------------------------------------				
+--physician facility mastering
+--start off to get a physician npi pool, each rows has one claim number
+select count(*)
+from claims_submits_provider_npi_type2; --5,484,808,473
+
+--first get all potential individuals
+--unioning together all types of NPI's
+create or replace table sandbox.ml_claims_submits_provider_npi_individual_1 as
+select claim_number
+		, rendering_npi as source_npi
+		, 'Rendering' as source_type
+from sandbox.claims_submits_provider_npi_type2
+where facility_npi is null and rendering_npi is not null
+UNION ALL
+select claim_number
+		, referring_npi as source_npi
+		, 'Referring' as source_type
+from sandbox.claims_submits_provider_npi_type2
+where facility_npi is null and rendering_npi is null and referring_npi is not null
+UNION ALL
+select claim_number
+		, billing_npi as source_npi
+		, 'Billing' as source_type
+from sandbox.claims_submits_provider_npi_type2
+where facility_npi is null 
+		and rendering_npi is null 
+		and referring_npi is null
+		and billing_npi is not null;
+
+		
+		
+--check against cmsnpi to make sure the npi is for an individual
+create or replace table sandbox.ml_claims_submits_provider_npi_individual_2 as
+select distinct claim_number
+				, source_npi
+				, source_type
+				, entity_type_code
+from sandbox.ml_claims_submits_provider_npi_individual_1 A
+		left join sandbox.srn_cmsnpi_latest B
+				on A.source_npi = B.npi
+where entity_type_code = '1' or entity_type_code is null;
+
+
+--check against healthbase to make sure the npi is for an individual
+create or replace table sandbox.ml_claims_submits_provider_npi_individual_3 as
+select distinct claim_number
+				, source_npi
+				, source_type
+				, entity_type_code
+				, case when node_1_label = 'physician' then '1'
+                        when node_1_label is null then null --only allow phycisians or nulls
+                        else '3' end as node_1_label
+from sandbox.ml_claims_submits_provider_npi_individual_2 A
+		left join sandbox.entities_for_hs6 B
+				on A.source_npi = B.service_npi;
+
+
+--combine entity_type_code and node_1_label to get description of facility
+create or replace table sandbox.ml_claims_submits_provider_npi_individual_4 as
+select distinct claim_number
+				, source_npi
+				, source_type
+				, coalesce(entity_type_code, node_1_label) as entity_type_code
+from sandbox.ml_claims_submits_provider_npi_individual_3
+where coalesce(entity_type_code, node_1_label) = '1' or coalesce(entity_type_code, node_1_label) is null;
+
+
+select *
+from ml_claims_submits_provider_npi_individual_4
+limit 100;
+
+
+--keep a record of those cannot be found in both cmsnpi and healthbase
+create or replace table sandbox.ml_claims_submits_provider_npi_individual_ghost as
+select *
+from sandbox.ml_claims_submits_provider_npi_individual_4
+where entity_type_code is null; --7,699,188
+
+
+
+--------------------------------------------------------------------------------------------
+--now map individual to organization npi
+--first use ml_claims_submits_rendering_facility_claim_count_row_number_filtered_6
+create or replace table sandbox.ml_claims_submits_provider_npi_individual_map_to_organization_1 as
+select distinct claim_number
+				, source_npi
+				, source_type
+				, entity_type_code
+				, B.facility_npi
+				, B.organization_label
+from sandbox.ml_claims_submits_provider_npi_individual_4 A
+		left join sandbox.ml_claims_submits_rendering_facility_claim_count_row_number_filtered_5 B
+				on A.source_npi = B.rendering_npi;
+				
+
+select count(*)
+from ml_claims_submits_provider_npi_individual_map_to_organization_1 --2416815616
+where organization_label is null; --621655630 -> 579824342/2416815616 = 25.7%
+
+--second use OCGN
+create or replace table sandbox.ml_claims_submits_provider_npi_individual_map_to_organization_2 as
+select distinct claim_number
+				, source_npi
+				, source_type
+				, entity_type_code
+				, coalesce(A.facility_npi, B.facility_npi) as facility_npi
+				, case when B.facility_npi is not null 
+						then coalesce(A.organization_label, B.organization_label)
+						else A.organization_label end as organization_label
+from sandbox.ml_claims_submits_provider_npi_individual_map_to_organization_1 A
+		 left join sandbox.ml_ocgn_physicin_facility_mapping_2 B
+				on A.source_npi = B.rendering_npi;
+
+
+select count(*)
+from ml_claims_submits_provider_npi_individual_map_to_organization_1 --2416815616
+where organization_label is null; --621220579 /2416815616 = 25.7%
+
+
+--get those that have a valid organization label
+create or replace table sandbox.ml_claims_submits_provider_npi_individual_map_to_organization_3 as
+select *
+from sandbox.ml_claims_submits_provider_npi_individual_map_to_organization_2
+where organization_label is not null;
+
+--get those unmapped case, where we can't find an organization label
+create or replace table sandbox.ml_claims_submits_provider_npi_individual_map_to_organization_4 as
+select *
+from sandbox.ml_claims_submits_provider_npi_individual_map_to_organization_2
+where organization_label is null; --621220579
+
+
+
+
+--get provider location info for these unmapped cases
+--first for condor, condor's attending mapped to rendering 
+--and referring mapped to reffereing
+--and billing mapped to billing
+--but bililng has location info, referring or attending don't!!!
+create or replace table sandbox.ml_claims_submits_provider_npi_individual_map_to_organization_unmapped_condor_1 as
+select A.claim_number
+		, A.source_npi
+		, A.source_type
+		, A.entity_type_code
+		, A.organization_label
+from sandbox.ml_claims_submits_provider_npi_individual_map_to_organization_4 A
+where left(A.claim_number,3) = 'con'; --522,349,806
+
+--get address info from provider table
+create or replace table sandbox.ml_claims_submits_provider_npi_individual_map_to_organization_unmapped_condor_2 as
+select A.claim_number
+		, A.source_npi
+		, A.source_type
+		, A.entity_type_code
+		, A.organization_label
+		, B.provider_npi
+		, B.provider_type
+		, B.adr_line1
+		, B.adr_line2
+		, B.adr_city
+		, B.adr_state
+		, B.adr_zip
+from sandbox.ml_claims_submits_provider_npi_individual_map_to_organization_unmapped_condor_1 A --
+		inner join sandbox.claims_submits_provider B
+				on A.claim_number = B.claim_number
+				and A.source_npi = B.provider_npi
+				and (case when A.source_type = 'Rendering' then 'Attending' 
+						else A.source_type end ) = B.provider_type; --522,350,509, more?!
+						
+--only get those having adr_line1 and adr_city
+create or replace table sandbox.ml_claims_submits_provider_npi_individual_map_to_organization_unmapped_condor_3 as
+select distinct *
+from sandbox.ml_claims_submits_provider_npi_individual_map_to_organization_unmapped_condor_2
+where adr_line1 is not null and adr_city is not null; --46,304,606
+
+
+--second for albatross 
+--rendering is rendering, but no address info
+--referring is referring, but no address info
+--billing is biling, but no address info 
+
+
+--third for vulture
+--rendering is reindering
+--refering is refering
+--billing is billing
+--this limits to just the vulture claims
+create or replace table sandbox.ml_claims_submits_provider_npi_individual_map_to_organization_unmapped_vulture_1 as
+select A.claim_number
+		, A.source_npi
+		, A.source_type
+		, A.entity_type_code
+		, A.organization_label
+from sandbox.ml_claims_submits_provider_npi_individual_map_to_organization_4 A
+where left(A.claim_number,3) = 'vul'; --61,225,976
+
+
+--get address from provider table for unmapped vulture claims
+create or replace table sandbox.ml_claims_submits_provider_npi_individual_map_to_organization_unmapped_vulture_2 as
+select A.claim_number
+		, A.source_npi
+		, A.source_type
+		, A.entity_type_code
+		, A.organization_label
+		, B.provider_npi
+		, B.provider_type
+		, B.adr_line1
+		, B.adr_line2
+		, B.adr_city
+		, B.adr_state
+		, B.adr_zip
+from sandbox.ml_claims_submits_provider_npi_individual_map_to_organization_unmapped_vulture_1 A --
+		inner join sandbox.claims_submits_provider B
+				on A.claim_number = B.claim_number
+				and A.source_npi = B.provider_npi
+				and A.source_type= B.provider_type; --61,225,976
+
+						
+--only get those having adr_line1 and adr_city
+create or replace table sandbox.ml_claims_submits_provider_npi_individual_map_to_organization_unmapped_vulture_3 as
+select distinct *
+from sandbox.ml_claims_submits_provider_npi_individual_map_to_organization_unmapped_vulture_2
+where adr_line1 is not null and adr_city is not null; --60199066
+
+
+--merge condor and vulture
+create or replace table sandbox.ml_claims_submits_provider_npi_individual_map_to_organization_unmapped_1 as
+select *
+from sandbox.ml_claims_submits_provider_npi_individual_map_to_organization_unmapped_condor_3
+union all 
+select *
+from sandbox.ml_claims_submits_provider_npi_individual_map_to_organization_unmapped_vulture_3; --106,495,672
+
+
+
+--for those having address, pull in additional information
+create or replace table sandbox.ml_claims_submits_provider_npi_individual_map_to_organization_unmapped_2 as
+select 	A.*
+		, B.PROVIDER_FIRST_LINE_BUSINESS_PRACTICE_LOCATION_ADDRESS
+		, B.PROVIDER_BUSINESS_PRACTICE_LOCATION_ADDRESS_CITY_NAME
+		, C.npi 
+		, C.entity_type_code as cms_npi_entity_type_code
+		, C.PROVIDER_ORGANIZATION_NAME_LEGAL_BUSINESS_NAME
+from sandbox.ml_claims_submits_provider_npi_individual_map_to_organization_unmapped_1 A
+		left join sandbox.srn_cmsnpi_latest B
+				on A.adr_line1 = B.PROVIDER_FIRST_LINE_BUSINESS_PRACTICE_LOCATION_ADDRESS
+				and A.adr_city = B.PROVIDER_BUSINESS_PRACTICE_LOCATION_ADDRESS_CITY_NAME
+		left join sandbox.srn_cmsnpi_latest C
+				on B.PROVIDER_FIRST_LINE_BUSINESS_PRACTICE_LOCATION_ADDRESS = C.PROVIDER_FIRST_LINE_BUSINESS_PRACTICE_LOCATION_ADDRESS
+				and B.PROVIDER_BUSINESS_PRACTICE_LOCATION_ADDRESS_CITY_NAME = C.PROVIDER_BUSINESS_PRACTICE_LOCATION_ADDRESS_CITY_NAME
+where C.entity_type_code = '2'; --5.6G
+
+
+--dedupe
+create or replace table sandbox.ml_claims_submits_provider_npi_individual_map_to_organization_unmapped_3 as
+select distinct	*
+from sandbox.ml_claims_submits_provider_npi_individual_map_to_organization_unmapped_2;  --45,776,790
+
+
+
+
+
+--let see if it happens that one physician maps to two locations
+select count(distinct claim_number)
+from sandbox.ml_claims_submits_provider_npi_individual_map_to_organization_unmapped_3; --11,856,594 --one physician maps to two locations .....
+
+
+--only leave those with one to one mapping
+create or replace table sandbox.ml_claims_submits_provider_npi_individual_map_to_organization_unmapped_4 as
+select A.*
+from sandbox.ml_claims_submits_provider_npi_individual_map_to_organization_unmapped_3  A
+		inner join (
+						select claim_number, count(npi)
+						from ml_claims_submits_provider_npi_individual_map_to_organization_unmapped_3
+						group by claim_number
+						having count(npi) = 1
+						
+					) B
+				on A.claim_number = B.claim_number; --6,134,683
+				
+
+
+--add label
+create or replace table sandbox.ml_claims_submits_provider_npi_individual_map_to_organization_unmapped_5 as
+select A.*
+		, B.identifier
+		, B.label
+from sandbox.ml_claims_submits_provider_npi_individual_map_to_organization_unmapped_4 A
+		left join rwd.healthbase_entitylookup B
+				on  A.npi = B.identifier;
+				
+
+create or replace table sandbox.ml_claims_submits_provider_npi_individual_map_to_organization_unmapped_not_in_healthbase as
+select *
+from sandbox.ml_claims_submits_provider_npi_individual_map_to_organization_unmapped_5
+where identifier is null;
+
+
+---------------------
+--combine unmapped and mapped cases
+create or replace table sandbox.ml_claims_submits_provider_npi_individual_map_to_organization_5 as
+select claim_number
+		, source_npi
+		, source_type
+		, entity_type_code
+		, facility_npi as orgniazation_npi
+		, organization_label
+from sandbox.ml_claims_submits_provider_npi_individual_map_to_organization_3
+UNION ALL
+select claim_number
+		, source_npi
+		, source_type
+		, entity_type_code
+		, npi
+		, label as organization_label
+from sandbox.ml_claims_submits_provider_npi_individual_map_to_organization_unmapped_in_healthbase;
+
+
+--get healthsystem info
+create or replace table sandbox.ml_claims_submits_provider_npi_individual_map_to_organization_6 as
+select distinct  claim_number
+				, source_npi
+				, source_type
+				, entity_type_code
+				, orgniazation_npi
+				, organization_label
+				, syst.ID as System_ID, 
+				syst.Healthsystem_Name,
+				syst.healthbase_id
+from sandbox.ml_claims_submits_provider_npi_individual_map_to_organization_5 A
+		left join sandbox.healthbase_map_to_top_health_system syst
+				on A.orgniazation_npi = syst.identifier;
+
+
+--get hospital info
+create or replace table sandbox.ml_claims_submits_provider_npi_individual_map_to_organization_7 as
+select distinct  claim_number
+				, source_npi
+				, source_type
+				, entity_type_code
+				, orgniazation_npi
+				, organization_label
+				, System_ID
+				, Healthsystem_Name
+				, C.healthbase_id
+				, POS_OTHER_FAC_NAME as facility_name
+				, POS_OTHER_ST_ADR as FACILITY_ADDRESS
+				, POS_OTHER_CITY_NAME as FACILITY_CITY
+				, POS_OTHER_STATE_CD as FACILITY_STATE
+				, POS_OTHER_ZIP_CD as FACILITY_ZIP
+from sandbox.ml_claims_submits_provider_npi_individual_map_to_organization_6 A
+		left join rwd.healthbase_entitylookup B
+				on A.orgniazation_npi = B.identifier
+		left join rwd.healthbase_hospital C
+				on B.healthbase_id = C.healthbase_id;		--1798983214		
+				
+select count(distinct claim_number)
+from 	ml_claims_submits_provider_npi_individual_map_to_organization_7;	--1798983214	
+
+
+--case statement for entity_type_code
+create or replace table sandbox.ml_claims_submits_provider_npi_individual_map_to_organization_8 as
+select claim_number
+				, source_npi
+				, source_type
+				, case when entity_type_code is null then '1' else entity_type_code end as entity_type_code
+				, orgniazation_npi
+				, organization_label
+				, System_ID
+				, Healthsystem_Name
+				, healthbase_id
+				, facility_name
+				, FACILITY_ADDRESS
+				, FACILITY_CITY
+				, FACILITY_STATE
+				, FACILITY_ZIP
+from sandbox.ml_claims_submits_provider_npi_individual_map_to_organization_7;
+
+
+--union with facility mastering table
+create or replace table sandbox.claims_submits_facility_master_union as
+select *
+from sandbox.claims_submits_provider_npi_type_facility_mapping_final
+union all
+select *
+from sandbox.ml_claims_submits_provider_npi_individual_map_to_organization_8; --4599235347
+
+
+--detect duplicates with both entity_type_code 1 and 2		
+--check dup claim_number in this table				
+create or replace table sandbox.ml_claims_submits_facility_master_dup_1 as
+select claim_number, count(*) as dup
+from sandbox.claims_submits_facility_master_union
+group by claim_number
+having count(*)> 1
+order by count(*);
+
+
+
+create or replace table sandbox.ml_claims_submits_facility_master_dup_2 as
+select distinct B.*
+from sandbox.ml_claims_submits_facility_master_dup_1 A
+		inner join sandbox.claims_submits_facility_master_union B
+				on A.claim_number = B.claim_number;
+				
+select *
+from ml_claims_submits_facility_master_dup_2
+order by claim_number, source_npi_type;
+
+--physician records to be deleted				
+create or replace table sandbox.ml_claims_submits_facility_master_dup_3 as
+select *
+from sandbox.ml_claims_submits_facility_master_dup_2
+where source_npi_type = '1'; --616,626
+
+--Final table below!!
+--delete records from claims_submits_facility_master_union
+create or replace table sandbox.claims_submits_facility_master as
+select A.*
+from sandbox.claims_submits_facility_master_union A
+		left join ml_claims_submits_facility_master_dup_3 B
+				on A.claim_number = B.claim_number
+				and A.source_npi_type =  B.source_npi_type
+where B.claim_number is null; --4,598,618,721
