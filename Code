@@ -1,5 +1,5 @@
 ------------------------------------------------------------------------------------
---count of all the records
+--count of all the records from the Raven provider table, which has the NPI info we need to examine
 select count(distinct claim_number) from claims_submits_provider;--5,484,808,473 distinct claim numbers
 
 describe table claims_submits_provider;
@@ -7,6 +7,7 @@ select * from claims_submits_provider limit 100;
 
 ---------------------------------------------------------------------------------------------
 
+--creating columnns for different NPI's associated with each claim number
 CREATE OR REPLACE TABLE claims_submits_provider_NPI_type as
 select distinct(claim_number) as claim_number, 
 
@@ -108,7 +109,7 @@ select * from claims_submits_provider_npi_type2 limit 10;
 /*This was for the excel I generated*/
 select * from claims_submits_provider_npi_type2 limit 100;
             
-        --getting all the different counts, not making a table
+        --getting all the different counts, not making a table, this was for a separate excel request not related to final table
       select 
       --we have facility
       count(distinct case when facility_npi is not null and facility_npi <> '' 
@@ -193,7 +194,7 @@ select * from claims_submits_provider_npi_type4 limit 1000;
 --checking above
 select count(*) from claims_submits_provider_npi_type4 limit 100;--1,000,798,312
       
---adding in healthsystemname when we have it based on rendering being an organization
+--adding in healthsystemname when we have it based on rendering being an organization, which was a column created in a previous step
 
 CREATE OR REPLACE TABLE claims_submits_provider_npi_type5 as
 
@@ -215,6 +216,7 @@ left join sandbox.healthbase_map_to_top_health_system syst
 on three.rendering_organization = syst.identifier;
 
 --------------------------------------------------------------------------
+--pulling out only instances where the billing npi is an organization
 CREATE OR REPLACE TABLE claims_submits_provider_billing_intermediate as
 
 select two.*, billing_npi as facility_organization_npi
@@ -230,6 +232,7 @@ select count(*) from claims_submits_provider_billing_intermediate limit 100;
 select count(*) from claims_submits_provider_billing_intermediate limit 100;
 --adding in healthsystemname when we have it based on billing being an organization
 
+--joining in health system info for billing npi's, when they are an organization
 CREATE OR REPLACE TABLE claims_submits_provider_npi_typebilling as
 
 select 
@@ -255,7 +258,7 @@ select count(*) from claims_submits_provider_npi_typebilling;
 not like 'A%'
 
 -----------------------------------------------------------------------------
---intermediate step based on referring being an organization
+--intermediate step based on referring being an organization, doing inner join because we only want referrings that are organization
 CREATE OR REPLACE TABLE claims_submits_provider_referring_intermediate as
 
 select two.*, referring_npi as facility_organization_npi
@@ -290,7 +293,7 @@ on three.referring_npi = syst.identifier;
 
 
 
---unioning the tables together
+--unioning the tables together, where they are organizations
 CREATE OR REPLACE TABLE claims_submits_provider_npi_type6 as
 
 select * 
@@ -316,7 +319,6 @@ select *
 from CLAIMS_SUBMITS_PROVIDER_NPI_TYPEBILLING;
 
 --adding in the hospital name info stuff
-
 CREATE OR REPLACE TABLE claims_submits_provider_npi_type_7 as
 
 select six.*, 
@@ -334,7 +336,8 @@ on six.healthbase_id = hosp.healthbase_id;
 
 
 select count(*) from claims_submits_provider_npi_type6;
---limiting to only instances where we have an NPI
+
+--limiting to only instances where we have an NPI, precautionary and maybe unneeded step
 CREATE OR REPLACE TABLE claims_submits_provider_npi_type_8 as
 select * from claims_submits_provider_npi_type_7 where source_npi is not null;
 
@@ -398,9 +401,9 @@ left join rwd.healthbase_entitylookup look
 
 on npi.Healthbase_id = look.Healthbase_ID; 
 
---unioning with label for organization brought in from both entitylookup and map to top health system table
-select * from claims_submits_provider_npi_type_final limit 100;
 
+/*coalescing the two labels for the facility name, since the fill rate isn't perfect between the two columns and we want to capture
+facility name when possible*/
 CREATE OR REPLACE TABLE claims_submits_provider_npi_type_facility_mapping as
 
 select 
@@ -455,120 +458,3 @@ select distinct organization_type from claims_submits_provider_npi_type_facility
 --grant the table to maddy
 grant all on claims_submits_provider_npi_type_facility_mapping_final to rwd_sandbox;
 
-
-
-
-
-----------------------------------------------------------------------------------------------------------------
---the below was so we could get counts of when 
-CREATE OR REPLACE TABLE Claims_submits_npi_all as
-
-select 
-
-npi.*,
-cms.npi as facility_individual,
-cms1.npi as rendering_individual
-
-from claims_submits_provider_npi_type2 npi
-
-left join (select npi, entity_type_code from srn_cmsnpi_latest where entity_type_code = '1') cms
-
-on facility_npi = cms.npi
-
-left join (select npi, entity_type_code from srn_cmsnpi_latest where entity_type_code = '1') cms1
-
-on rendering_npi = cms1.npi;
-
---
-CREATE OR REPLACE TABLE Claims_submits_npi_all as
-
-select 
-
-npi.*,
-cms2.npi as referring_individual,
-cms3.npi as billing_individual
-
-
-from Claims_submits_npi_all npi
-
-left join (select npi, entity_type_code from srn_cmsnpi_latest where entity_type_code = '1') cms2
-
-on referring_npi = cms2.npi
-
-left join (select npi, entity_type_code from srn_cmsnpi_latest where entity_type_code = '1') cms3
-
-on billing_npi = cms3.npi;
-
---
-CREATE OR REPLACE TABLE claims_submits_npi_all as
-
-select
-
-npi.*,
-cms4.npi as facility_organization,
-cms5.npi as rendering_organization2
-
-from claims_submits_npi_all npi
-
-left join (select npi, entity_type_code from srn_cmsnpi_latest where entity_type_code = '2') cms4
-
-on facility_npi = cms4.npi
-
-left join (select npi, entity_type_code from srn_cmsnpi_latest where entity_type_code = '2') cms5
-
-on rendering_npi = cms5.npi;
-
---
-CREATE OR REPLACE TABLE claims_submits_npi_all as
-
-
-select
-
-npi.*,
-cms6.npi as referring_organization,
-cms7.npi as billing_organization
-
-from claims_submits_npi_all npi
-
-left join (select npi, entity_type_code from srn_cmsnpi_latest where entity_type_code = '2') cms6
-
-on referring_npi = cms6.npi
-
-left join (select npi, entity_type_code from srn_cmsnpi_latest where entity_type_code = '2') cms7
-
-on billing_npi = cms7.npi;
-
-select * from claims_submits_npi_all limit 100;
-describe table claims_submits_npi_all;
-
----Getting the npi fill rates
-select 
-
-count (distinct case when facility_individual is null and rendering_individual is null and referring_individual is null and billing_individual is null then claim_number else null end) as f1,
-count (distinct case when facility_individual is null and rendering_individual is null and referring_individual is null and billing_individual is not null then claim_number else null end) as f2,
-count (distinct case when facility_individual is null and rendering_individual is null and referring_individual is not null and billing_individual is null then claim_number else null end) as f3,
-count (distinct case when facility_individual is null and rendering_individual is null and referring_individual is not null and billing_individual is not null then claim_number else null end) as f4,
-
-count (distinct case when facility_individual is null and rendering_individual is not null and referring_individual is null and billing_individual is null then claim_number else null end) as f5,
-count (distinct case when facility_individual is null and rendering_individual is not null and referring_individual is null and billing_individual is not null then claim_number else null end) as f6,
-count (distinct case when facility_individual is null and rendering_individual is not null and referring_individual is not null and billing_individual is null then claim_number else null end) as f7,
-count (distinct case when facility_individual is null and rendering_individual is not null and referring_individual is not null and billing_individual is not null then claim_number else null end) as f8,
-
-count (distinct case when facility_organization is null and rendering_organization2 is null and referring_organization is null and billing_organization is null then claim_number else null end) as f9,
-count (distinct case when facility_organization is null and rendering_organization2 is null and referring_organization is null and billing_organization is not null then claim_number else null end) as f10,
-count (distinct case when facility_organization is null and rendering_organization2 is null and referring_organization is not null and billing_organization is null then claim_number else null end) as f11,
-count (distinct case when facility_organization is null and rendering_organization2 is null and referring_organization is not null and billing_organization is not null then claim_number else null end) as f12,
-
-count (distinct case when facility_organization is null and rendering_organization2 is not null and referring_organization is null and billing_organization is null then claim_number else null end) as f13,
-count (distinct case when facility_organization is null and rendering_organization2 is not null and referring_organization is null and billing_organization is not null then claim_number else null end) as f14,
-count (distinct case when facility_organization is null and rendering_organization2 is not null and referring_organization is not null and billing_organization is null then claim_number else null end) as f15,
-count (distinct case when facility_organization is null and rendering_organization2 is not null and referring_organization is not null and billing_organization is not null then claim_number else null end) as f16
-
-from claims_submits_npi_all;
-
-describe table claims_submits_provider_npi_type2;
-describe table srn_cmsnpi_latest;
-
-select * from claims_submits_npi_all limit 100;
-
-grant all on claims_submits_npi_all to rwd_sandbox;
